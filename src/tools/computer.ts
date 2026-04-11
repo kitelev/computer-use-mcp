@@ -18,6 +18,11 @@ import sharp from 'sharp';
 import {toKeys} from '../xdotoolStringToKeys.js';
 import {jsonResult} from '../utils/response.js';
 
+function log(message: string): void {
+	const timestamp = new Date().toISOString().slice(11, 23); // HH:mm:ss.SSS
+	console.error(`[computer-use ${timestamp}] ${message}`);
+}
+
 /**
  * Grab the screen, falling back to the macOS `screencapture` CLI if nut-js fails
  * (e.g. on macOS 26+ where CGDisplayCreateImageForRect was removed).
@@ -187,6 +192,13 @@ export function registerComputer(server: McpServer): void {
 		},
 		async (args) => {
 			const {action, coordinate, text} = args as {action: z.infer<typeof ActionEnum>; coordinate?: [number, number]; text?: string};
+			const startTime = Date.now();
+
+			// Build a concise description of the incoming call
+			const parts: string[] = [action];
+			if (coordinate) parts.push(`coord=(${coordinate[0]},${coordinate[1]})`);
+			if (text) parts.push(`text=${JSON.stringify(text.length > 80 ? text.slice(0, 80) + '…' : text)}`);
+			log(`→ ${parts.join(' ')}`);
 
 			// Scale coordinates from API image space to logical screen space
 			let scaledCoordinate = coordinate;
@@ -196,11 +208,13 @@ export function registerComputer(server: McpServer): void {
 					Math.round(coordinate[0] * scale),
 					Math.round(coordinate[1] * scale),
 				];
+				log(`  scaled coord: (${coordinate[0]},${coordinate[1]}) → (${scaledCoordinate[0]},${scaledCoordinate[1]}) (scale=${scale.toFixed(3)})`);
 
 				// Validate coordinates are within display bounds
 				const [x, y] = scaledCoordinate;
 				const [width, height] = [await screen.width(), await screen.height()];
 				if (x < 0 || x >= width || y < 0 || y >= height) {
+					log(`  ✗ out of bounds: (${x},${y}) display=${width}x${height}`);
 					throw new Error(`Coordinates (${x}, ${y}) are outside display bounds of ${width}x${height}`);
 				}
 			}
@@ -213,9 +227,11 @@ export function registerComputer(server: McpServer): void {
 					}
 
 					const keys = toKeys(text);
+					log(`  key combo: ${text} → ${keys.length} key(s)`);
 					await keyboard.pressKey(...keys);
 					await keyboard.releaseKey(...keys);
 
+					log(`  ✓ key done (${Date.now() - startTime}ms)`);
 					return jsonResult({ok: true});
 				}
 
@@ -224,24 +240,25 @@ export function registerComputer(server: McpServer): void {
 						throw new Error('Text required for type');
 					}
 
-					if (process.platform === 'linux' && hasXdotool()) {
+					const method = (process.platform === 'linux' && hasXdotool()) ? 'xdotool' : 'nut-js';
+					log(`  type: ${text.length} chars via ${method}`);
+					if (method === 'xdotool') {
 						xdotoolType(text);
 					} else {
 						await keyboard.type(text);
 					}
 
+					log(`  ✓ type done (${Date.now() - startTime}ms)`);
 					return jsonResult({ok: true});
 				}
 
 				case 'get_cursor_position': {
 					const pos = await mouse.getPosition();
 					const scale = await getApiToLogicalScale();
-					// Return coordinates in API image space (scaled down from logical)
-					// so Claude can correlate with what it sees in screenshots
-					return jsonResult({
-						x: Math.round(pos.x / scale),
-						y: Math.round(pos.y / scale),
-					});
+					const apiX = Math.round(pos.x / scale);
+					const apiY = Math.round(pos.y / scale);
+					log(`  cursor: logical=(${pos.x},${pos.y}) api=(${apiX},${apiY}) (${Date.now() - startTime}ms)`);
+					return jsonResult({x: apiX, y: apiY});
 				}
 
 				case 'mouse_move': {
@@ -250,6 +267,7 @@ export function registerComputer(server: McpServer): void {
 					}
 
 					await mouse.setPosition(new Point(scaledCoordinate[0], scaledCoordinate[1]));
+					log(`  ✓ mouse_move done (${Date.now() - startTime}ms)`);
 					return jsonResult({ok: true});
 				}
 
@@ -259,6 +277,7 @@ export function registerComputer(server: McpServer): void {
 					}
 
 					await mouse.leftClick();
+					log(`  ✓ left_click done (${Date.now() - startTime}ms)`);
 					return jsonResult({ok: true});
 				}
 
@@ -270,6 +289,7 @@ export function registerComputer(server: McpServer): void {
 					await mouse.pressButton(Button.LEFT);
 					await mouse.setPosition(new Point(scaledCoordinate[0], scaledCoordinate[1]));
 					await mouse.releaseButton(Button.LEFT);
+					log(`  ✓ left_click_drag done (${Date.now() - startTime}ms)`);
 					return jsonResult({ok: true});
 				}
 
@@ -279,6 +299,7 @@ export function registerComputer(server: McpServer): void {
 					}
 
 					await mouse.rightClick();
+					log(`  ✓ right_click done (${Date.now() - startTime}ms)`);
 					return jsonResult({ok: true});
 				}
 
@@ -288,6 +309,7 @@ export function registerComputer(server: McpServer): void {
 					}
 
 					await mouse.click(Button.MIDDLE);
+					log(`  ✓ middle_click done (${Date.now() - startTime}ms)`);
 					return jsonResult({ok: true});
 				}
 
@@ -297,6 +319,7 @@ export function registerComputer(server: McpServer): void {
 					}
 
 					await mouse.doubleClick(Button.LEFT);
+					log(`  ✓ double_click done (${Date.now() - startTime}ms)`);
 					return jsonResult({ok: true});
 				}
 
@@ -344,18 +367,21 @@ export function registerComputer(server: McpServer): void {
 							throw new Error(`Invalid scroll direction: ${direction}. Use "up", "down", "left", or "right"`);
 					}
 
+					log(`  ✓ scroll ${direction} ${amount}px done (${Date.now() - startTime}ms)`);
 					return jsonResult({ok: true});
 				}
 
 				case 'get_screenshot': {
-					// Wait a bit to let things load before showing it to Claude
+					log(`  waiting 1s for screen to settle…`);
 					await setTimeout(1000);
 
 					// Get cursor position in logical coordinates
 					const cursorPos = await mouse.getPosition();
 
 					// Capture the entire screen (may be at Retina resolution)
+					const captureStart = Date.now();
 					const image = await grabScreen();
+					log(`  captured ${image.getWidth()}x${image.getHeight()} (${Date.now() - captureStart}ms)`);
 
 					// Then resize to fit within API limits
 					const apiScaleFactor = getSizeToApiScale(image.getWidth(), image.getHeight());
@@ -418,6 +444,7 @@ export function registerComputer(server: McpServer): void {
 
 					// Convert optimized buffer to base64
 					const base64Data = optimizedBuffer.toString('base64');
+					log(`  ✓ screenshot ${imageWidth}x${imageHeight} → ${(optimizedBuffer.length / 1024).toFixed(0)}KB base64 (${Date.now() - startTime}ms)`);
 
 					return {
 						content: [
