@@ -23,6 +23,32 @@ function log(message: string): void {
 	console.error(`[computer-use ${timestamp}] ${message}`);
 }
 
+const TEXT_PREVIEW_MAX = 500;
+
+type TextPreview = {
+	preview: string;
+	truncated: boolean;
+	total: number;
+};
+
+/**
+ * Build a single preview of a user-supplied string for both stderr logs and
+ * tool-result JSON, so the two views can never drift. Keeps up to `max` chars
+ * verbatim and appends an explicit `…[+N chars]` tail when longer, so the
+ * reader can always recover the total length even when the payload is clipped.
+ */
+function previewText(text: string, max: number = TEXT_PREVIEW_MAX): TextPreview {
+	if (text.length <= max) {
+		return {preview: text, truncated: false, total: text.length};
+	}
+
+	return {
+		preview: `${text.slice(0, max)}…[+${text.length - max} chars]`,
+		truncated: true,
+		total: text.length,
+	};
+}
+
 type MacDiagnostics = {
 	front_app?: string;
 	window_title?: string;
@@ -266,10 +292,17 @@ export function registerComputer(server: McpServer): void {
 			const {action, coordinate, text} = args as {action: z.infer<typeof ActionEnum>; coordinate?: [number, number]; text?: string};
 			const startTime = Date.now();
 
-			// Build a concise description of the incoming call
+			// Build a concise description of the incoming call.
+			// Text uses the same preview helper as the action-level logs and the
+			// tool-result JSON, so a reader can always see exactly what the model
+			// asked to type (up to the cap) and the total length.
 			const parts: string[] = [action];
 			if (coordinate) parts.push(`coord=(${coordinate[0]},${coordinate[1]})`);
-			if (text) parts.push(`text=${JSON.stringify(text.length > 80 ? text.slice(0, 80) + '…' : text)}`);
+			if (text) {
+				const p = previewText(text);
+				parts.push(`text=${JSON.stringify(p.preview)} (len=${p.total}${p.truncated ? ', truncated' : ''})`);
+			}
+
 			log(`→ ${parts.join(' ')}`);
 
 			// Scale coordinates from API image space to logical screen space
@@ -309,12 +342,18 @@ export function registerComputer(server: McpServer): void {
 					}
 
 					const keys = toKeys(text);
-					log(`  key combo: ${text} → ${keys.length} key(s)`);
+					const keyPreview = previewText(text);
+					log(`  key combo: ${JSON.stringify(keyPreview.preview)} → ${keys.length} key(s)`);
 					await keyboard.pressKey(...keys);
 					await keyboard.releaseKey(...keys);
 
 					log(`  ✓ key done (${Date.now() - startTime}ms)`);
-					return jsonResult(await decorate(buildDiag({key: text, key_count: keys.length})));
+					return jsonResult(await decorate(buildDiag({
+						key: keyPreview.preview,
+						key_truncated: keyPreview.truncated,
+						key_length: keyPreview.total,
+						key_count: keys.length,
+					})));
 				}
 
 				case 'type': {
@@ -323,7 +362,8 @@ export function registerComputer(server: McpServer): void {
 					}
 
 					const method = (process.platform === 'linux' && hasXdotool()) ? 'xdotool' : 'nut-js';
-					log(`  type: ${text.length} chars via ${method}`);
+					const typedPreview = previewText(text);
+					log(`  type: ${JSON.stringify(typedPreview.preview)} (${typedPreview.total} chars${typedPreview.truncated ? ', truncated' : ''}) via ${method}`);
 					if (method === 'xdotool') {
 						xdotoolType(text);
 					} else {
@@ -331,7 +371,12 @@ export function registerComputer(server: McpServer): void {
 					}
 
 					log(`  ✓ type done (${Date.now() - startTime}ms)`);
-					return jsonResult(await decorate(buildDiag({chars: text.length, method})));
+					return jsonResult(await decorate(buildDiag({
+						text: typedPreview.preview,
+						text_truncated: typedPreview.truncated,
+						chars: typedPreview.total,
+						method,
+					})));
 				}
 
 				case 'get_cursor_position': {
@@ -450,7 +495,7 @@ export function registerComputer(server: McpServer): void {
 					}
 
 					log(`  ✓ scroll ${direction} ${amount}px done (${Date.now() - startTime}ms)`);
-					return jsonResult({ok: true});
+					return jsonResult(await decorate(buildDiag({direction: direction.toLowerCase(), amount})));
 				}
 
 				case 'get_screenshot': {
