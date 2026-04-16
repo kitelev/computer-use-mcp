@@ -8,7 +8,7 @@ import {
 	Button,
 	imageToJimp,
 } from '@nut-tree-fork/nut-js';
-import {execFileSync} from 'node:child_process';
+import {execFileSync, execFile} from 'node:child_process';
 import {readFileSync, unlinkSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -21,6 +21,104 @@ import {jsonResult} from '../utils/response.js';
 function log(message: string): void {
 	const timestamp = new Date().toISOString().slice(11, 23); // HH:mm:ss.SSS
 	console.error(`[computer-use ${timestamp}] ${message}`);
+}
+
+const TEXT_PREVIEW_MAX = 500;
+
+type TextPreview = {
+	preview: string;
+	truncated: boolean;
+	total: number;
+};
+
+/**
+ * Build a single preview of a user-supplied string for both stderr logs and
+ * tool-result JSON, so the two views can never drift. Keeps up to `max` chars
+ * verbatim and appends an explicit `…[+N chars]` tail when longer, so the
+ * reader can always recover the total length even when the payload is clipped.
+ */
+function previewText(text: string, max: number = TEXT_PREVIEW_MAX): TextPreview {
+	if (text.length <= max) {
+		return {preview: text, truncated: false, total: text.length};
+	}
+
+	return {
+		preview: `${text.slice(0, max)}…[+${text.length - max} chars]`,
+		truncated: true,
+		total: text.length,
+	};
+}
+
+type MacDiagnostics = {
+	front_app?: string;
+	window_title?: string;
+};
+
+/**
+ * Query the frontmost macOS application and its focused window title via
+ * AppleScript. Bounded timeout, never throws — returns an empty object on
+ * any failure so diagnostic decoration is a best-effort enrichment.
+ */
+async function getMacDiagnostics(): Promise<MacDiagnostics> {
+	if (process.platform !== 'darwin') {
+		return {};
+	}
+
+	const script = `
+tell application "System Events"
+	set frontApp to name of first application process whose frontmost is true
+	set winTitle to ""
+	try
+		tell process frontApp
+			if (count of windows) > 0 then
+				set winTitle to name of front window
+			end if
+		end tell
+	end try
+end tell
+return frontApp & "\\t" & winTitle
+`;
+
+	return new Promise<MacDiagnostics>((resolve) => {
+		const child = execFile(
+			'osascript',
+			['-e', script],
+			{timeout: 500, maxBuffer: 64 * 1024},
+			(err, stdout) => {
+				if (err || typeof stdout !== 'string') {
+					resolve({});
+					return;
+				}
+
+				const [front_app, window_title] = stdout.trim().split('\t');
+				const out: MacDiagnostics = {};
+				if (front_app) out.front_app = front_app;
+				if (window_title) out.window_title = window_title;
+				resolve(out);
+			},
+		);
+		child.on('error', () => resolve({}));
+	});
+}
+
+type ActionDiag = {
+	action: string;
+	ok: boolean;
+	duration_ms: number;
+	coord_api?: [number, number];
+	coord_logical?: [number, number];
+	scale?: number;
+	display?: {width: number; height: number};
+	extra?: Record<string, unknown>;
+};
+
+async function decorate(diag: ActionDiag): Promise<Record<string, unknown>> {
+	const mac = await getMacDiagnostics();
+	return {
+		...diag,
+		...mac,
+		ts: new Date().toISOString(),
+	};
 }
 
 /**
@@ -194,10 +292,17 @@ export function registerComputer(server: McpServer): void {
 			const {action, coordinate, text} = args as {action: z.infer<typeof ActionEnum>; coordinate?: [number, number]; text?: string};
 			const startTime = Date.now();
 
-			// Build a concise description of the incoming call
+			// Build a concise description of the incoming call.
+			// Text uses the same preview helper as the action-level logs and the
+			// tool-result JSON, so a reader can always see exactly what the model
+			// asked to type (up to the cap) and the total length.
 			const parts: string[] = [action];
 			if (coordinate) parts.push(`coord=(${coordinate[0]},${coordinate[1]})`);
-			if (text) parts.push(`text=${JSON.stringify(text.length > 80 ? text.slice(0, 80) + '…' : text)}`);
+			if (text) {
+				const p = previewText(text);
+				parts.push(`text=${JSON.stringify(p.preview)} (len=${p.total}${p.truncated ? ', truncated' : ''})`);
+			}
+
 			log(`→ ${parts.join(' ')}`);
 
 			// Scale coordinates from API image space to logical screen space
@@ -219,6 +324,16 @@ export function registerComputer(server: McpServer): void {
 				}
 			}
 
+			// Reusable diag builder closing over current action inputs
+			const buildDiag = (extra?: Record<string, unknown>): ActionDiag => ({
+				action,
+				ok: true,
+				duration_ms: Date.now() - startTime,
+				...(coordinate ? {coord_api: coordinate} : {}),
+				...(scaledCoordinate ? {coord_logical: scaledCoordinate} : {}),
+				...(extra ? {extra} : {}),
+			});
+
 			// Implement system actions using nut-js
 			switch (action) {
 				case 'key': {
@@ -227,12 +342,18 @@ export function registerComputer(server: McpServer): void {
 					}
 
 					const keys = toKeys(text);
-					log(`  key combo: ${text} → ${keys.length} key(s)`);
+					const keyPreview = previewText(text);
+					log(`  key combo: ${JSON.stringify(keyPreview.preview)} → ${keys.length} key(s)`);
 					await keyboard.pressKey(...keys);
 					await keyboard.releaseKey(...keys);
 
 					log(`  ✓ key done (${Date.now() - startTime}ms)`);
-					return jsonResult({ok: true});
+					return jsonResult(await decorate(buildDiag({
+						key: keyPreview.preview,
+						key_truncated: keyPreview.truncated,
+						key_length: keyPreview.total,
+						key_count: keys.length,
+					})));
 				}
 
 				case 'type': {
@@ -241,7 +362,8 @@ export function registerComputer(server: McpServer): void {
 					}
 
 					const method = (process.platform === 'linux' && hasXdotool()) ? 'xdotool' : 'nut-js';
-					log(`  type: ${text.length} chars via ${method}`);
+					const typedPreview = previewText(text);
+					log(`  type: ${JSON.stringify(typedPreview.preview)} (${typedPreview.total} chars${typedPreview.truncated ? ', truncated' : ''}) via ${method}`);
 					if (method === 'xdotool') {
 						xdotoolType(text);
 					} else {
@@ -249,7 +371,12 @@ export function registerComputer(server: McpServer): void {
 					}
 
 					log(`  ✓ type done (${Date.now() - startTime}ms)`);
-					return jsonResult({ok: true});
+					return jsonResult(await decorate(buildDiag({
+						text: typedPreview.preview,
+						text_truncated: typedPreview.truncated,
+						chars: typedPreview.total,
+						method,
+					})));
 				}
 
 				case 'get_cursor_position': {
@@ -258,7 +385,7 @@ export function registerComputer(server: McpServer): void {
 					const apiX = Math.round(pos.x / scale);
 					const apiY = Math.round(pos.y / scale);
 					log(`  cursor: logical=(${pos.x},${pos.y}) api=(${apiX},${apiY}) (${Date.now() - startTime}ms)`);
-					return jsonResult({x: apiX, y: apiY});
+					return jsonResult(await decorate(buildDiag({x: apiX, y: apiY, cursor_logical: [pos.x, pos.y]})));
 				}
 
 				case 'mouse_move': {
@@ -268,7 +395,7 @@ export function registerComputer(server: McpServer): void {
 
 					await mouse.setPosition(new Point(scaledCoordinate[0], scaledCoordinate[1]));
 					log(`  ✓ mouse_move done (${Date.now() - startTime}ms)`);
-					return jsonResult({ok: true});
+					return jsonResult(await decorate(buildDiag()));
 				}
 
 				case 'left_click': {
@@ -278,7 +405,7 @@ export function registerComputer(server: McpServer): void {
 
 					await mouse.leftClick();
 					log(`  ✓ left_click done (${Date.now() - startTime}ms)`);
-					return jsonResult({ok: true});
+					return jsonResult(await decorate(buildDiag()));
 				}
 
 				case 'left_click_drag': {
@@ -290,7 +417,7 @@ export function registerComputer(server: McpServer): void {
 					await mouse.setPosition(new Point(scaledCoordinate[0], scaledCoordinate[1]));
 					await mouse.releaseButton(Button.LEFT);
 					log(`  ✓ left_click_drag done (${Date.now() - startTime}ms)`);
-					return jsonResult({ok: true});
+					return jsonResult(await decorate(buildDiag()));
 				}
 
 				case 'right_click': {
@@ -300,7 +427,7 @@ export function registerComputer(server: McpServer): void {
 
 					await mouse.rightClick();
 					log(`  ✓ right_click done (${Date.now() - startTime}ms)`);
-					return jsonResult({ok: true});
+					return jsonResult(await decorate(buildDiag()));
 				}
 
 				case 'middle_click': {
@@ -310,7 +437,7 @@ export function registerComputer(server: McpServer): void {
 
 					await mouse.click(Button.MIDDLE);
 					log(`  ✓ middle_click done (${Date.now() - startTime}ms)`);
-					return jsonResult({ok: true});
+					return jsonResult(await decorate(buildDiag()));
 				}
 
 				case 'double_click': {
@@ -320,7 +447,7 @@ export function registerComputer(server: McpServer): void {
 
 					await mouse.doubleClick(Button.LEFT);
 					log(`  ✓ double_click done (${Date.now() - startTime}ms)`);
-					return jsonResult({ok: true});
+					return jsonResult(await decorate(buildDiag()));
 				}
 
 				case 'scroll': {
@@ -368,7 +495,7 @@ export function registerComputer(server: McpServer): void {
 					}
 
 					log(`  ✓ scroll ${direction} ${amount}px done (${Date.now() - startTime}ms)`);
-					return jsonResult({ok: true});
+					return jsonResult(await decorate(buildDiag({direction: direction.toLowerCase(), amount})));
 				}
 
 				case 'get_screenshot': {
@@ -446,16 +573,29 @@ export function registerComputer(server: McpServer): void {
 					const base64Data = optimizedBuffer.toString('base64');
 					log(`  ✓ screenshot ${imageWidth}x${imageHeight} → ${(optimizedBuffer.length / 1024).toFixed(0)}KB base64 (${Date.now() - startTime}ms)`);
 
+					const screenshotDiag = await decorate({
+						action,
+						ok: true,
+						duration_ms: Date.now() - startTime,
+						extra: {
+							image_width: imageWidth,
+							image_height: imageHeight,
+							display: {
+								width: await screen.width(),
+								height: await screen.height(),
+							},
+							cursor_logical: [cursorPos.x, cursorPos.y],
+							cursor_image: [cursorInImageX, cursorInImageY],
+							scale: Number(scale.toFixed(4)),
+							png_kb: Math.round(optimizedBuffer.length / 1024),
+						},
+					});
+
 					return {
 						content: [
 							{
 								type: 'text',
-								text: JSON.stringify({
-									// Report the image dimensions - Claude should use coordinates within this space
-									// These may differ from the actual display due to scaling for API limits
-									image_width: imageWidth,
-									image_height: imageHeight,
-								}),
+								text: JSON.stringify(screenshotDiag, null, 2),
 							},
 							{
 								type: 'image',
