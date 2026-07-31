@@ -9,6 +9,7 @@ import {
 	imageToJimp,
 } from '@nut-tree-fork/nut-js';
 import {execFileSync, execFile} from 'node:child_process';
+import {promisify} from 'node:util';
 import {readFileSync, unlinkSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -17,6 +18,8 @@ import Jimp from 'jimp';
 import sharp from 'sharp';
 import {toKeys} from '../xdotoolStringToKeys.js';
 import {jsonResult} from '../utils/response.js';
+
+const execFileAsync = promisify(execFile);
 
 function log(message: string): void {
 	const timestamp = new Date().toISOString().slice(11, 23); // HH:mm:ss.SSS
@@ -122,27 +125,53 @@ async function decorate(diag: ActionDiag): Promise<Record<string, unknown>> {
 }
 
 /**
- * Grab the screen, falling back to the macOS `screencapture` CLI if nut-js fails
- * (e.g. on macOS 26+ where CGDisplayCreateImageForRect was removed).
+ * Whether nut-js `screen.grab()` works on this machine.
+ *
+ * Probed once and cached, mirroring the `hasXdotool()` pattern below. On macOS 26+
+ * `CGDisplayCreateImageForRect` was removed, so `screen.grab()` fails *permanently* —
+ * re-probing it costs a thrown-exception round-trip on every single screenshot, and
+ * makes the fallback look exceptional when it is in fact the steady state.
  */
-async function grabScreen(): Promise<ReturnType<typeof imageToJimp>> {
+let nutScreenGrabWorks: boolean | undefined;
+
+/** @internal Exported for tests: clears the cached capability probe. */
+export function resetScreenGrabProbe(): void {
+	nutScreenGrabWorks = undefined;
+}
+
+/** Capture via the macOS `screencapture` CLI (async: does not block the event loop). */
+async function captureViaScreencapture(): Promise<ReturnType<typeof imageToJimp>> {
+	const tmpPath = join(tmpdir(), `computer-use-mcp-${Date.now()}.png`);
 	try {
-		return imageToJimp(await screen.grab());
-	} catch {
-		// Fallback: use screencapture CLI (macOS only)
-		const tmpPath = join(tmpdir(), `computer-use-mcp-${Date.now()}.png`);
+		await execFileAsync('screencapture', ['-x', tmpPath]);
+		const buffer = readFileSync(tmpPath);
+		return (await Jimp.read(buffer)) as unknown as ReturnType<typeof imageToJimp>;
+	} finally {
 		try {
-			execFileSync('screencapture', ['-x', tmpPath]);
-			const buffer = readFileSync(tmpPath);
-			return (await Jimp.read(buffer)) as unknown as ReturnType<typeof imageToJimp>;
-		} finally {
-			try {
-				unlinkSync(tmpPath);
-			} catch {
-				/* ignore cleanup errors */
-			}
+			unlinkSync(tmpPath);
+		} catch {
+			/* ignore cleanup errors */
 		}
 	}
+}
+
+/**
+ * Grab the screen, falling back to the macOS `screencapture` CLI if nut-js is
+ * unavailable. The nut-js path is probed at most once per process.
+ */
+export async function grabScreen(): Promise<ReturnType<typeof imageToJimp>> {
+	if (nutScreenGrabWorks !== false) {
+		try {
+			const image = imageToJimp(await screen.grab());
+			nutScreenGrabWorks = true;
+			return image;
+		} catch {
+			// Permanent on this platform — stop probing it for the rest of the process.
+			nutScreenGrabWorks = false;
+		}
+	}
+
+	return captureViaScreencapture();
 }
 
 // Configure nut-js
