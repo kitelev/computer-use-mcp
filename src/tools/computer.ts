@@ -10,6 +10,7 @@ import {
 } from '@nut-tree-fork/nut-js';
 import {execFileSync, execFile} from 'node:child_process';
 import {promisify} from 'node:util';
+import {randomUUID} from 'node:crypto';
 import {readFileSync, unlinkSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
@@ -125,23 +126,33 @@ async function decorate(diag: ActionDiag): Promise<Record<string, unknown>> {
 }
 
 /**
- * Whether nut-js `screen.grab()` works on this machine.
+ * Whether nut-js `screen.grab()` is usable on this machine.
  *
- * Probed once and cached, mirroring the `hasXdotool()` pattern below. On macOS 26+
- * `CGDisplayCreateImageForRect` was removed, so `screen.grab()` fails *permanently* —
- * re-probing it costs a thrown-exception round-trip on every single screenshot, and
- * makes the fallback look exceptional when it is in fact the steady state.
+ * `undefined` = not probed yet, `true` = has worked at least once, `false` = the very
+ * first probe failed, so the capability is treated as absent for the rest of the process.
+ *
+ * Motivation: on macOS 26+ `CGDisplayCreateImageForRect` was removed, so `screen.grab()`
+ * fails permanently there and re-probing costs a thrown-exception round-trip on every
+ * single screenshot, while making the fallback look exceptional when it is the steady state.
+ *
+ * ⚠ Deliberately NOT the same shape as `hasXdotool()` below: that one probes once and can
+ * never change its mind. Here a failure is only latched when the capability has *never*
+ * worked. Once `screen.grab()` has succeeded, a later failure is treated as transient and
+ * is NOT latched — otherwise a single blip (display asleep, X11 hiccup) would permanently
+ * divert to `screencapture`, which does not exist on Linux/Windows at all.
+ *
+ * Note this is best-effort, not a strict once-per-process guarantee: concurrent first
+ * calls can each probe before any of them records a result. That is harmless — they
+ * simply race to write the same value.
  */
 let nutScreenGrabWorks: boolean | undefined;
 
-/** @internal Exported for tests: clears the cached capability probe. */
-export function resetScreenGrabProbe(): void {
-	nutScreenGrabWorks = undefined;
-}
-
 /** Capture via the macOS `screencapture` CLI (async: does not block the event loop). */
 async function captureViaScreencapture(): Promise<ReturnType<typeof imageToJimp>> {
-	const tmpPath = join(tmpdir(), `computer-use-mcp-${Date.now()}.png`);
+	// randomUUID, not Date.now(): concurrent captures used to be serialised by the blocking
+	// execFileSync, but the async exec lets several land in the same millisecond — and the
+	// 1s "let the screen settle" sleep before each grab actively aligns them.
+	const tmpPath = join(tmpdir(), `computer-use-mcp-${randomUUID()}.png`);
 	try {
 		await execFileAsync('screencapture', ['-x', tmpPath]);
 		const buffer = readFileSync(tmpPath);
@@ -156,8 +167,8 @@ async function captureViaScreencapture(): Promise<ReturnType<typeof imageToJimp>
 }
 
 /**
- * Grab the screen, falling back to the macOS `screencapture` CLI if nut-js is
- * unavailable. The nut-js path is probed at most once per process.
+ * Grab the screen, falling back to the macOS `screencapture` CLI when nut-js capture is
+ * unavailable. nut-js is re-probed only while it has never been seen working.
  */
 export async function grabScreen(): Promise<ReturnType<typeof imageToJimp>> {
 	if (nutScreenGrabWorks !== false) {
@@ -165,9 +176,16 @@ export async function grabScreen(): Promise<ReturnType<typeof imageToJimp>> {
 			const image = imageToJimp(await screen.grab());
 			nutScreenGrabWorks = true;
 			return image;
-		} catch {
-			// Permanent on this platform — stop probing it for the rest of the process.
-			nutScreenGrabWorks = false;
+		} catch (error) {
+			if (nutScreenGrabWorks === true) {
+				// It has worked before → treat as transient: fall back for THIS call only,
+				// and probe nut-js again next time so the process can self-heal.
+				log(`  nut-js screen.grab() failed transiently, using screencapture: ${String(error)}`);
+			} else {
+				// Never worked → capability is absent (e.g. macOS 26+). Stop probing.
+				nutScreenGrabWorks = false;
+				log(`  nut-js screen.grab() unavailable, using screencapture from now on: ${String(error)}`);
+			}
 		}
 	}
 
