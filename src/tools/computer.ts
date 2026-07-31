@@ -146,9 +146,11 @@ async function decorate(diag: ActionDiag): Promise<Record<string, unknown>> {
  *    there, re-probing is the only thing that can ever succeed.
  *
  * Not a strict once-per-process guarantee: concurrent calls can each probe before any of them
- * records a result, so the counter may advance by more than one per round. That only makes
- * the latch arrive a call or two earlier — it cannot make a *proven* success latch, because
- * every success resets the counter to zero unconditionally.
+ * records a result, so the counter may advance by more than one per round, and a burst of
+ * failures can cross the threshold while a successful grab is still in flight. That success
+ * therefore *un-latches* — safe by construction, because once latched `screen.grab()` is
+ * never called again, so the only success that can still arrive is one that started before
+ * the latch, and it is proof the capability exists.
  */
 const MAX_CONSECUTIVE_NUT_GRAB_FAILURES = 3;
 let consecutiveNutGrabFailures = 0;
@@ -162,7 +164,8 @@ const SCREENCAPTURE_TIMEOUT_MS = 10_000;
  *
  * Asynchronous so the capture does not block the event loop, and bounded by a timeout:
  * `screencapture` can wedge (permission dialog, unresponsive WindowServer), and without one
- * the promise would never settle, hanging the tool call with no way to recover.
+ * the promise could hang indefinitely with no way to recover. The timeout is a mitigation,
+ * not a guarantee — Node sends SIGTERM and the callback fires only once the child exits.
  */
 async function captureViaScreencapture(): Promise<ReturnType<typeof imageToJimp>> {
 	// randomUUID, not Date.now(): concurrent captures used to be serialised by the blocking
@@ -192,6 +195,9 @@ export async function grabScreen(): Promise<ReturnType<typeof imageToJimp>> {
 		try {
 			const image = imageToJimp(await screen.grab());
 			consecutiveNutGrabFailures = 0;
+			// Undo a latch that a concurrent failure burst set while this grab was in flight:
+			// a success is proof the capability exists.
+			nutScreenGrabDisabled = false;
 			return image;
 		} catch (error) {
 			consecutiveNutGrabFailures += 1;

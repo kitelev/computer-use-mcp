@@ -137,6 +137,28 @@ describe('grabScreen capability probe', () => {
 		expect(grabMock).toHaveBeenCalledTimes(6);
 	});
 
+	it('un-latches when a success was in flight while a failure burst crossed the threshold', async () => {
+		// A concurrent burst can advance the counter past the threshold while a healthy grab
+		// is still running. Latching on that would disable a capability we have just seen work.
+		let releaseSuccess: (value: unknown) => void = () => undefined;
+		const slowSuccess = new Promise((resolve) => {
+			releaseSuccess = resolve;
+		});
+		grabMock
+			.mockImplementationOnce(async () => slowSuccess)
+			.mockRejectedValueOnce(new Error('burst'))
+			.mockRejectedValueOnce(new Error('burst'))
+			.mockRejectedValueOnce(new Error('burst'))
+			.mockResolvedValue({} as never);
+		const grabScreen = await loadGrabScreen();
+
+		const burst = Promise.all([grabScreen(), grabScreen(), grabScreen(), grabScreen()]);
+		releaseSuccess({});
+		await burst;
+
+		expect((await grabScreen()).source).toBe('nut-js');
+	});
+
 	it('never gives up on nut-js off macOS, where screencapture does not exist', async () => {
 		// Latching here would leave no working capture path at all.
 		stubPlatform('linux');
