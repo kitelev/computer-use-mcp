@@ -59,13 +59,62 @@ type MacDiagnostics = {
 };
 
 /**
+ * TTL of the macOS diagnostics cache.
+ *
+ * `decorate()` runs on EVERY computer action and used to spawn one `osascript`
+ * child process per action. Measured 2026-08-21 (interval deltas, four rounds):
+ *
+ *   execFile('osascript') x1600   -> rss 46.0 -> 62.8 MB  ~= 0.0105 MB/call
+ *   native setMousePosition x8000 -> rss 94.0 -> 100.8 MB ~= 0.00085 MB/call
+ *
+ * The per-action spawn retains twelve times what the native mouse call does, and
+ * it is charged to every action. Issue #7 missed it because its measurement was
+ * DIFFERENTIAL and both compared branches call `decorate()`, so the common — and
+ * larger — term cancelled out.
+ *
+ * Half a second: long enough to coalesce the burst inside a single action, short
+ * enough that a stale front_app cannot outlive the action that changed it.
+ */
+const MAC_DIAG_TTL_MS = 500;
+
+/**
+ * Actions that cannot move focus. Everything else invalidates the cache.
+ *
+ * Deliberately inverted: listing the FOCUS-CHANGING actions instead would put
+ * every future action outside the guard by default, and the failure would be
+ * silent — a new action lands, focus moves, and `decorate()` keeps reporting the
+ * PREVIOUS front app. Listing the read-only ones makes an unknown action
+ * invalidate by construction; the cost is at most one extra `osascript` for an
+ * unrecognised action, which is the safe side.
+ */
+const READ_ONLY_ACTIONS = new Set(['get_screenshot', 'get_cursor_position']);
+
+let macDiagCache: {value: MacDiagnostics; at: number} | undefined;
+
+/**
+ * Drop the cached diagnostics. Called after anything that can move focus, so the
+ * next `decorate()` reports the NEW frontmost app rather than the previous one.
+ */
+export function invalidateMacDiagnostics(): void {
+	macDiagCache = undefined;
+}
+
+/**
  * Query the frontmost macOS application and its focused window title via
  * AppleScript. Bounded timeout, never throws — returns an empty object on
  * any failure so diagnostic decoration is a best-effort enrichment.
  */
-async function getMacDiagnostics(): Promise<MacDiagnostics> {
+// Exported for the cache axes in computer-diag-cache.test.ts: the guarantee is about
+// how many child processes a burst of actions spawns, and counting that requires
+// calling this directly.
+export async function getMacDiagnostics(): Promise<MacDiagnostics> {
 	if (process.platform !== 'darwin') {
 		return {};
+	}
+
+	const now = Date.now();
+	if (macDiagCache !== undefined && now - macDiagCache.at < MAC_DIAG_TTL_MS) {
+		return macDiagCache.value;
 	}
 
 	const script = `
@@ -84,13 +133,23 @@ return frontApp & "\\t" & winTitle
 `;
 
 	return new Promise<MacDiagnostics>((resolve) => {
+		// Only a SUCCESSFUL answer is cached. Caching a failure would pin an empty
+		// diagnostics object for the whole TTL and hide a recovery that already happened.
+		const done = (value: MacDiagnostics, cacheable: boolean) => {
+			if (cacheable) {
+				macDiagCache = {value, at: Date.now()};
+			}
+
+			resolve(value);
+		};
+
 		const child = execFile(
 			'osascript',
 			['-e', script],
 			{timeout: 500, maxBuffer: 64 * 1024},
 			(err, stdout) => {
 				if (err || typeof stdout !== 'string') {
-					resolve({});
+					done({}, false);
 					return;
 				}
 
@@ -98,10 +157,10 @@ return frontApp & "\\t" & winTitle
 				const out: MacDiagnostics = {};
 				if (front_app) out.front_app = front_app;
 				if (window_title) out.window_title = window_title;
-				resolve(out);
+				done(out, true);
 			},
 		);
-		child.on('error', () => resolve({}));
+		child.on('error', () => done({}, false));
 	});
 }
 
@@ -404,6 +463,13 @@ export function registerComputer(server: McpServer): void {
 			});
 
 			// Implement system actions using nut-js
+			// Anything that is not read-only can move focus, so the cached front_app must
+			// not survive it. One point, before dispatch — a per-branch call would go stale
+			// the moment someone adds a branch.
+			if (!READ_ONLY_ACTIONS.has(action)) {
+				invalidateMacDiagnostics();
+			}
+
 			switch (action) {
 				case 'key': {
 					if (!text) {
