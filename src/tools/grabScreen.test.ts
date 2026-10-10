@@ -80,7 +80,9 @@ async function callTimes(grabScreen: GrabScreen, n: number): Promise<string[]> {
 describe('grabScreen capture path', () => {
 	beforeEach(() => {
 		grabMock.mockReset();
-		execFileMock.mockClear();
+		// mockReset, not mockClear: G6 queues a once-implementation that a mutant may never
+		// consume, and mockClear would leak it into the next test's first exec.
+		execFileMock.mockReset();
 		stubPlatform('darwin');
 	});
 
@@ -101,6 +103,21 @@ describe('grabScreen capture path', () => {
 		expect(sources).toEqual(['screencapture', 'screencapture', 'screencapture']);
 		expect(execFileMock).toHaveBeenCalledTimes(3);
 		expect(execFileMock.mock.calls.every((c) => c[0] === 'screencapture')).toBe(true);
+	});
+
+	it('G6 on macOS a failed screencapture surfaces its error and never falls back in-process', async () => {
+		// The in-process grab is the ONLY path from this process to replayd, so a fallback to it —
+		// however rare — re-opens the ping-pong this file exists to prevent. nut-js would work
+		// here; that is the condition under which a "helpful" fallback would be taken.
+		grabMock.mockResolvedValue({} as never);
+		execFileMock.mockImplementationOnce((...args: unknown[]) => {
+			(args.at(-1) as (e: unknown) => void)(new Error('screencapture wedged'));
+			return {on: vi.fn()};
+		});
+		const grabScreen = await loadGrabScreen();
+
+		await expect(grabScreen()).rejects.toThrow('screencapture wedged');
+		expect(grabMock).not.toHaveBeenCalled();
 	});
 
 	it('G2 off macOS captures via nut-js and never spawns screencapture', async () => {
@@ -137,7 +154,8 @@ describe('grabScreen capture path', () => {
 		// A callback after the options object proves the async form is used, not execFileSync.
 		expect(execFileMock).toHaveBeenCalledTimes(1);
 		expect(execFileMock.mock.calls[0]![0]).toBe('screencapture');
-		expect(execFileMock.mock.calls[0]![2]).toMatchObject({timeout: expect.any(Number) as number});
+		// > 0: Node treats `timeout: 0` as "no timeout", which would leave a wedged capture unbounded.
+		expect((execFileMock.mock.calls[0]![2] as {timeout: number}).timeout).toBeGreaterThan(0);
 		expect(typeof execFileMock.mock.calls[0]![3]).toBe('function');
 	});
 

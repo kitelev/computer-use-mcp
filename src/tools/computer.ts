@@ -217,25 +217,32 @@ async function captureViaScreencapture(): Promise<ReturnType<typeof imageToJimp>
  * Grab the screen.
  *
  * On macOS the capture ALWAYS runs in a short-lived `screencapture` child process and never
- * in-process through nut-js `screen.grab()`. This is the fix for GitHub #3 (footprint growing
- * to 7-11 GB with no tool calls at all), and the reason is the process lifetime, not speed.
+ * in-process through nut-js `screen.grab()` — not even as a fallback when `screencapture` fails:
+ * that error is surfaced to the caller instead. This is the fix for GitHub #3 (footprint growing
+ * to 7-11 GB while the server received no tool calls), and the reason is process lifetime, not
+ * speed.
  *
- * Mechanism, observed in the unified log on macOS 26.4.1:
+ * Mechanism, read from the unified log and reproduced on standalone instances (macOS 26.4.1):
  *
  * 1. nut-js captures via `CGDisplayCreateImageForRect`, which macOS proxies through ReplayKit
- *    (`SLSHWCaptureDesktopProxying` -> `RPDaemonProxy` -> `replayd`). The first capture leaves a
- *    persistent XPC connection from THIS process to `replayd` for the rest of its life.
+ *    (`SLSHWCaptureDesktopProxying` -> `RPDaemonProxy` -> `replayd`). After the first capture the
+ *    calling process keeps an XPC connection to `replayd` (still held minutes later, with no
+ *    further calls).
  * 2. `replayd` identifies clients by executable path ("using identifier from executablePath").
  *    Every MCP instance is the same `node` binary, so two instances that have each captured once
- *    are one client to `replayd`: accepting the newer connection cancels the older one.
- * 3. ReplayKit in the evicted process reconnects immediately, which evicts the other one — an
- *    endless ping-pong (`RPDaemonProxy: connection INTERRUPTED`, ~170 000 times a minute per
- *    process, `replayd` at ~50 % CPU), and each round leaks inside the long-lived process.
+ *    look like one client: accepting the newer connection cancels the older one.
+ * 3. ReplayKit in the evicted process reconnects at once, which evicts the other one, and the
+ *    two keep doing that. Measured over 7 minutes: ~272 000 `RPDaemonProxy: connection
+ *    INTERRUPTED` log lines per process, and each process grew ~37-40 MB/min (the same rate the
+ *    passive sampler recorded in the 2026-10-10 incident, which ran for 4.5 hours until the
+ *    processes were killed). Killing one process stopped the other one's growth.
  *
- * A single capturing process is stable, which is why this looked like a rare event: it starts
- * only when a SECOND long-lived `node` process captures while the first is still alive, and it
- * never stops on its own. Running the capture in `screencapture` keeps the `replayd` connection
- * in a process that exits right after the shot, so nothing outlives the call.
+ * One capturing process alone did not grow (208 -> 83 MB over 3 minutes), which is why this
+ * looked like a rare event: it needs a SECOND long-lived `node` process to capture while the
+ * first is still alive. `screencapture` holds its `replayd` connection only until it exits after
+ * the shot. With this change two instances that had both captured stayed flat over the same
+ * 7-minute window and logged no interruptions; three rounds of simultaneous captures from two
+ * instances logged none either.
  *
  * Off macOS there is no `replayd` and no `screencapture`, so nut-js is the only path.
  */
