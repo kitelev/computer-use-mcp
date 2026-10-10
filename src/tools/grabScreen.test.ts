@@ -127,6 +127,9 @@ describe('grabScreen capture path', () => {
 	});
 
 	it('G4 bounds the screencapture child process with a timeout', async () => {
+		// nut-js fails here so this axis observes ONLY the child-process contract: whether
+		// macOS reaches `screencapture` at all is G1's concern, not this one's.
+		grabMock.mockRejectedValue(new Error('Failed to capture screen'));
 		const grabScreen = await loadGrabScreen();
 
 		await grabScreen();
@@ -141,6 +144,8 @@ describe('grabScreen capture path', () => {
 	it('G5 gives concurrent captures distinct temp paths', async () => {
 		// The async exec lets several captures land in the same millisecond, so a
 		// Date.now()-based name would collide and the captures would clobber each other.
+		// nut-js fails here for the same reason as in G4: the path choice is G1's concern.
+		grabMock.mockRejectedValue(new Error('Failed to capture screen'));
 		const grabScreen = await loadGrabScreen();
 
 		await Promise.all([grabScreen(), grabScreen(), grabScreen()]);
