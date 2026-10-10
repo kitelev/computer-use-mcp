@@ -184,37 +184,6 @@ async function decorate(diag: ActionDiag): Promise<Record<string, unknown>> {
 	};
 }
 
-/**
- * How many consecutive nut-js `screen.grab()` failures we have seen, and whether we have
- * given up probing it for the rest of the process.
- *
- * Motivation: on macOS 26+ `CGDisplayCreateImageForRect` was removed, so `screen.grab()`
- * fails permanently there and re-probing costs a thrown-exception round-trip on every
- * single screenshot, while making the fallback look exceptional when it is the steady state.
- *
- * ⚠ Deliberately NOT the same shape as `hasXdotool()` below, which probes once and can never
- * change its mind. Two guards keep this optimisation from becoming a regression against
- * simply retrying every time:
- *
- * 1. Only a RUN of consecutive failures latches; every success resets the counter. A blip
- *    (display asleep, X11 not up yet, or Screen Recording permission granted only after the
- *    first capture is attempted) therefore self-heals instead of diverting for the whole
- *    process lifetime.
- * 2. Latching happens only where a fallback actually exists. `screencapture` is a macOS
- *    binary, so on other platforms giving up on nut-js would leave no working path at all —
- *    there, re-probing is the only thing that can ever succeed.
- *
- * Not a strict once-per-process guarantee: concurrent calls can each probe before any of them
- * records a result, so the counter may advance by more than one per round, and a burst of
- * failures can cross the threshold while a successful grab is still in flight. That success
- * therefore *un-latches* — safe by construction, because once latched `screen.grab()` is
- * never called again, so the only success that can still arrive is one that started before
- * the latch, and it is proof the capability exists.
- */
-const MAX_CONSECUTIVE_NUT_GRAB_FAILURES = 3;
-let consecutiveNutGrabFailures = 0;
-let nutScreenGrabDisabled = false;
-
 /** How long `screencapture` may run before we treat it as wedged. */
 const SCREENCAPTURE_TIMEOUT_MS = 10_000;
 
@@ -245,32 +214,37 @@ async function captureViaScreencapture(): Promise<ReturnType<typeof imageToJimp>
 }
 
 /**
- * Grab the screen, falling back to the macOS `screencapture` CLI when nut-js capture fails.
- * nut-js stops being probed only after a run of consecutive failures, and only on macOS —
- * see the comment on the counter above.
+ * Grab the screen.
+ *
+ * On macOS the capture ALWAYS runs in a short-lived `screencapture` child process and never
+ * in-process through nut-js `screen.grab()`. This is the fix for GitHub #3 (footprint growing
+ * to 7-11 GB with no tool calls at all), and the reason is the process lifetime, not speed.
+ *
+ * Mechanism, observed in the unified log on macOS 26.4.1:
+ *
+ * 1. nut-js captures via `CGDisplayCreateImageForRect`, which macOS proxies through ReplayKit
+ *    (`SLSHWCaptureDesktopProxying` -> `RPDaemonProxy` -> `replayd`). The first capture leaves a
+ *    persistent XPC connection from THIS process to `replayd` for the rest of its life.
+ * 2. `replayd` identifies clients by executable path ("using identifier from executablePath").
+ *    Every MCP instance is the same `node` binary, so two instances that have each captured once
+ *    are one client to `replayd`: accepting the newer connection cancels the older one.
+ * 3. ReplayKit in the evicted process reconnects immediately, which evicts the other one — an
+ *    endless ping-pong (`RPDaemonProxy: connection INTERRUPTED`, ~170 000 times a minute per
+ *    process, `replayd` at ~50 % CPU), and each round leaks inside the long-lived process.
+ *
+ * A single capturing process is stable, which is why this looked like a rare event: it starts
+ * only when a SECOND long-lived `node` process captures while the first is still alive, and it
+ * never stops on its own. Running the capture in `screencapture` keeps the `replayd` connection
+ * in a process that exits right after the shot, so nothing outlives the call.
+ *
+ * Off macOS there is no `replayd` and no `screencapture`, so nut-js is the only path.
  */
 export async function grabScreen(): Promise<ReturnType<typeof imageToJimp>> {
-	if (!nutScreenGrabDisabled) {
-		try {
-			const image = imageToJimp(await screen.grab());
-			consecutiveNutGrabFailures = 0;
-			// Undo a latch that a concurrent failure burst set while this grab was in flight:
-			// a success is proof the capability exists.
-			nutScreenGrabDisabled = false;
-			return image;
-		} catch (error) {
-			consecutiveNutGrabFailures += 1;
-			const canFallBackPermanently = process.platform === 'darwin';
-			if (canFallBackPermanently && consecutiveNutGrabFailures >= MAX_CONSECUTIVE_NUT_GRAB_FAILURES) {
-				nutScreenGrabDisabled = true;
-				log(`  nut-js screen.grab() failed ${consecutiveNutGrabFailures}x in a row, using screencapture from now on: ${String(error)}`);
-			} else {
-				log(`  nut-js screen.grab() failed, using screencapture for this capture: ${String(error)}`);
-			}
-		}
+	if (process.platform === 'darwin') {
+		return captureViaScreencapture();
 	}
 
-	return captureViaScreencapture();
+	return imageToJimp(await screen.grab());
 }
 
 // Configure nut-js

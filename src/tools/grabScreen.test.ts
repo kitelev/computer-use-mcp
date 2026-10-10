@@ -3,7 +3,7 @@ import {
 } from 'vitest';
 
 // Fully mocked: CI runs on ubuntu-latest, where neither nut-js capture nor the macOS
-// `screencapture` binary exists. The mocks also let us count probe attempts.
+// `screencapture` binary exists. The mocks also let us count in-process grab attempts.
 const grabMock = vi.fn();
 
 vi.mock('@nut-tree-fork/nut-js', () => ({
@@ -77,7 +77,7 @@ async function callTimes(grabScreen: GrabScreen, n: number): Promise<string[]> {
 	return sources;
 }
 
-describe('grabScreen capability probe', () => {
+describe('grabScreen capture path', () => {
 	beforeEach(() => {
 		grabMock.mockReset();
 		execFileMock.mockClear();
@@ -88,105 +88,59 @@ describe('grabScreen capability probe', () => {
 		stubPlatform(realPlatform);
 	});
 
-	it('stops probing nut-js after a run of consecutive failures (macOS 26 steady state)', async () => {
-		grabMock.mockRejectedValue(new Error('Failed to capture screen'));
+	it('G1 on macOS never captures in-process via nut-js, even when nut-js would work (GitHub #3)', async () => {
+		// The in-process grab is proxied through ReplayKit and leaves a persistent connection to
+		// replayd. Two long-lived node processes holding one evict each other forever and both
+		// leak. A WORKING nut-js is the case that matters: the old code preferred it.
+		grabMock.mockResolvedValue({} as never);
 		const grabScreen = await loadGrabScreen();
 
-		const sources = await callTimes(grabScreen, 6);
+		const sources = await callTimes(grabScreen, 3);
 
-		// Without the latch this is 6 — one thrown-exception round-trip per screenshot.
-		expect(grabMock).toHaveBeenCalledTimes(3);
-		expect(sources.every((s) => s === 'screencapture')).toBe(true);
-		expect(execFileMock).toHaveBeenCalledTimes(6);
+		expect(grabMock).not.toHaveBeenCalled();
+		expect(sources).toEqual(['screencapture', 'screencapture', 'screencapture']);
+		expect(execFileMock).toHaveBeenCalledTimes(3);
+		expect(execFileMock.mock.calls.every((c) => c[0] === 'screencapture')).toBe(true);
 	});
 
-	it('keeps using nut-js when it works, without falling back', async () => {
+	it('G2 off macOS captures via nut-js and never spawns screencapture', async () => {
+		stubPlatform('linux');
 		grabMock.mockResolvedValue({} as never);
 		const grabScreen = await loadGrabScreen();
 
 		const sources = await callTimes(grabScreen, 2);
 
 		expect(grabMock).toHaveBeenCalledTimes(2);
-		expect(sources.every((s) => s === 'nut-js')).toBe(true);
+		expect(sources).toEqual(['nut-js', 'nut-js']);
 		expect(execFileMock).not.toHaveBeenCalled();
 	});
 
-	it('does NOT latch when successes keep breaking the failure run (self-heals)', async () => {
-		// Regression guard: latching on isolated blips would permanently divert to
-		// `screencapture` even though nut-js is healthy.
-		grabMock
-			.mockRejectedValueOnce(new Error('blip'))
-			.mockRejectedValueOnce(new Error('blip'))
-			.mockResolvedValueOnce({} as never)
-			.mockRejectedValueOnce(new Error('blip'))
-			.mockRejectedValueOnce(new Error('blip'))
-			.mockResolvedValueOnce({} as never);
-		const grabScreen = await loadGrabScreen();
-
-		const sources = await callTimes(grabScreen, 6);
-
-		expect(sources).toEqual([
-			'screencapture',
-			'screencapture',
-			'nut-js',
-			'screencapture',
-			'screencapture',
-			'nut-js',
-		]);
-		// Every call still probed: the run never reached the threshold.
-		expect(grabMock).toHaveBeenCalledTimes(6);
-	});
-
-	it('un-latches when a success was in flight while a failure burst crossed the threshold', async () => {
-		// A concurrent burst can advance the counter past the threshold while a healthy grab
-		// is still running. Latching on that would disable a capability we have just seen work.
-		let releaseSuccess: (value: unknown) => void = () => undefined;
-		const slowSuccess = new Promise((resolve) => {
-			releaseSuccess = resolve;
-		});
-		grabMock
-			.mockImplementationOnce(async () => slowSuccess)
-			.mockRejectedValueOnce(new Error('burst'))
-			.mockRejectedValueOnce(new Error('burst'))
-			.mockRejectedValueOnce(new Error('burst'))
-			.mockResolvedValue({} as never);
-		const grabScreen = await loadGrabScreen();
-
-		const burst = Promise.all([grabScreen(), grabScreen(), grabScreen(), grabScreen()]);
-		releaseSuccess({});
-		await burst;
-
-		expect((await grabScreen()).source).toBe('nut-js');
-	});
-
-	it('never gives up on nut-js off macOS, where screencapture does not exist', async () => {
-		// Latching here would leave no working capture path at all.
+	it('G3 off macOS a failed grab surfaces its own error instead of a missing-binary one', async () => {
+		// `screencapture` is a macOS binary: diverting to it elsewhere could only fail again,
+		// with an ENOENT that hides the real reason.
 		stubPlatform('linux');
 		grabMock.mockRejectedValue(new Error('Failed to capture screen'));
 		const grabScreen = await loadGrabScreen();
 
-		await callTimes(grabScreen, 6);
-
-		expect(grabMock).toHaveBeenCalledTimes(6);
+		await expect(grabScreen()).rejects.toThrow('Failed to capture screen');
+		expect(execFileMock).not.toHaveBeenCalled();
 	});
 
-	it('bounds the screencapture child process with a timeout', async () => {
-		grabMock.mockRejectedValue(new Error('Failed to capture screen'));
+	it('G4 bounds the screencapture child process with a timeout', async () => {
 		const grabScreen = await loadGrabScreen();
 
 		await grabScreen();
 
 		// A callback after the options object proves the async form is used, not execFileSync.
 		expect(execFileMock).toHaveBeenCalledTimes(1);
-		expect(execFileMock.mock.calls[0][0]).toBe('screencapture');
-		expect(execFileMock.mock.calls[0][2]).toMatchObject({timeout: expect.any(Number) as number});
-		expect(typeof execFileMock.mock.calls[0][3]).toBe('function');
+		expect(execFileMock.mock.calls[0]![0]).toBe('screencapture');
+		expect(execFileMock.mock.calls[0]![2]).toMatchObject({timeout: expect.any(Number) as number});
+		expect(typeof execFileMock.mock.calls[0]![3]).toBe('function');
 	});
 
-	it('gives concurrent fallback captures distinct temp paths', async () => {
+	it('G5 gives concurrent captures distinct temp paths', async () => {
 		// The async exec lets several captures land in the same millisecond, so a
 		// Date.now()-based name would collide and the captures would clobber each other.
-		grabMock.mockRejectedValue(new Error('Failed to capture screen'));
 		const grabScreen = await loadGrabScreen();
 
 		await Promise.all([grabScreen(), grabScreen(), grabScreen()]);
