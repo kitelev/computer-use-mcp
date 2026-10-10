@@ -233,9 +233,10 @@ async function captureViaScreencapture(): Promise<ReturnType<typeof imageToJimp>
  *    look like one client: accepting the newer connection cancels the older one.
  * 3. ReplayKit in the evicted process reconnects at once, which evicts the other one, and the
  *    two keep doing that. Measured over 7 minutes: ~272 000 `RPDaemonProxy: connection
- *    INTERRUPTED` log lines per process, and each process grew ~37-40 MB/min (the same rate the
- *    passive sampler recorded in the 2026-10-10 incident, which ran for 4.5 hours until the
- *    processes were killed). Killing one process stopped the other one's growth.
+ *    INTERRUPTED` log lines per process, and each process grew ~37-40 MB/min. In the 2026-10-10
+ *    incident the passive sampler recorded the same steady rate (36-40 MB/min in 5-minute
+ *    intervals, ~30 MB/min averaged over the whole window because of a slower stretch) for
+ *    4.5 hours, until the processes were killed. Killing one process stopped the other's growth.
  *
  * One capturing process alone did not grow (208 -> 83 MB over 3 minutes), which is why this
  * looked like a rare event: it needs a SECOND long-lived `node` process to capture while the

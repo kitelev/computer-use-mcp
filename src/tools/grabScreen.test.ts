@@ -92,8 +92,8 @@ describe('grabScreen capture path', () => {
 
 	it('G1 on macOS never captures in-process via nut-js, even when nut-js would work (GitHub #3)', async () => {
 		// The in-process grab is proxied through ReplayKit and leaves a persistent connection to
-		// replayd. Two long-lived node processes holding one evict each other forever and both
-		// leak. A WORKING nut-js is the case that matters: the old code preferred it.
+		// replayd. Two long-lived node processes holding one evict each other until one of them
+		// exits, and both leak meanwhile. A WORKING nut-js is the case that matters: the old code preferred it.
 		grabMock.mockResolvedValue({} as never);
 		const grabScreen = await loadGrabScreen();
 
@@ -155,7 +155,10 @@ describe('grabScreen capture path', () => {
 		expect(execFileMock).toHaveBeenCalledTimes(1);
 		expect(execFileMock.mock.calls[0]![0]).toBe('screencapture');
 		// > 0: Node treats `timeout: 0` as "no timeout", which would leave a wedged capture unbounded.
-		expect((execFileMock.mock.calls[0]![2] as {timeout: number}).timeout).toBeGreaterThan(0);
+		const {timeout} = execFileMock.mock.calls[0]![2] as {timeout: number};
+		expect(timeout).toBeGreaterThan(0);
+		// Upper bound too: a timeout of days is "no timeout" in practice.
+		expect(timeout).toBeLessThanOrEqual(30_000);
 		expect(typeof execFileMock.mock.calls[0]![3]).toBe('function');
 	});
 
